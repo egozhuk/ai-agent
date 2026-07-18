@@ -1,0 +1,24 @@
+.env
+.env.*
+!.env.example
+
+# Runtime data and local services
+data/
+.local/
+
+# Logs, databases and local state
+*.log
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets and private keys
+*.key
+*.p12
+*.pfx
+*.secret
+
+# macOS and IDE metadata
+.DS_Store
+.idea/
+.vscode/
