@@ -337,6 +337,17 @@ func (s *Store) DeleteTask(userID int64, taskID string) bool {
 	return n > 0
 }
 
+func (s *Store) DeleteTasksByKind(userID int64, kind string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`DELETE FROM tasks WHERE user_id = ? AND kind = ? AND active = 1`, userID, kind)
+	if err != nil {
+		return 0
+	}
+	n, _ := result.RowsAffected()
+	return int(n)
+}
+
 func (s *Store) Usage(userID int64) UserRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()

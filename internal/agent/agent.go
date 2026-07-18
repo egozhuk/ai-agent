@@ -162,7 +162,7 @@ func (a *Agent) HandleUpdate(ctx context.Context, update maxapi.Update) error {
 	}
 	switch strings.TrimSpace(strings.ToLower(text)) {
 	case "/start":
-		return a.send(ctx, update, "Готов. Я могу отвечать на вопросы, искать актуальную информацию в интернете и выполнять отложенные задачи.\n\nКоманды: `/remind`, `/watch`, `/reminders`, `/cancel`, `/clear_context`, `/usage`.")
+		return a.send(ctx, update, "Готов. Я могу отвечать на вопросы, искать актуальную информацию в интернете и выполнять отложенные задачи.\n\nКоманды: `/remind`, `/watch`, `/reminders`, `/clear_reminders`, `/cancel`, `/clear_context`, `/usage`.")
 	case "/clear_context", "/reset_context", "/clear":
 		if err := a.store.ClearHistory(userID); err != nil {
 			return err
@@ -176,6 +176,12 @@ func (a *Agent) HandleUpdate(ctx context.Context, update maxapi.Update) error {
 		return a.send(ctx, update, fmt.Sprintf("Токены по вашему пользователю:\n\n- prompt: `%d`\n- completion: `%d`\n- total: `%d`", usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens))
 	case "/reminders":
 		return a.listTasks(ctx, update, userID)
+	case "/clear_reminders", "/delete_all_reminders":
+		count := a.store.DeleteTasksByKind(userID, "reminder")
+		if count == 0 {
+			return a.send(ctx, update, "Активных напоминаний нет.")
+		}
+		return a.send(ctx, update, fmt.Sprintf("Удалил напоминаний: `%d`.", count))
 	case "/connect_google":
 		if !a.tools.GoogleConfigured() {
 			return a.send(ctx, update, "Google OAuth не настроен на сервере. Нужны `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_BASE_URL`, `TOKEN_ENCRYPTION_KEY`.")
