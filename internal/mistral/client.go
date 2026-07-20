@@ -288,7 +288,8 @@ func (c *Client) Complete(ctx context.Context, messages []Message, tools []Tool)
 func (c *Client) CompleteWithDocument(ctx context.Context, history []Message, question, documentURL string) (ChatResponse, error) {
 	messages := []documentChatMessage{{
 		Role: "system",
-		Content: "Ты отвечаешь на вопросы пользователя по прикрепленному документу. " +
+		Content: "Тебя зовут Люми. Всегда называй себя только Люми и никогда не используй другие имена для себя. " +
+			"Ты отвечаешь на вопросы пользователя по прикрепленному документу. " +
 			"Опирайся прежде всего на документ, не выдумывай отсутствующие факты и отвечай по-русски. " +
 			"Не упоминай провайдера, модель или внутренние инструменты.",
 	}}
@@ -343,11 +344,14 @@ func (c *Client) CompleteWithDocument(ctx context.Context, history []Message, qu
 	return out, nil
 }
 
-func (c *Client) PlanAutomation(ctx context.Context, inputs []Message) (*AutomationCall, error) {
-	now := time.Now().In(time.Local)
+func (c *Client) PlanAutomation(ctx context.Context, inputs []Message, location *time.Location) (*AutomationCall, error) {
+	if location == nil {
+		location = time.UTC
+	}
+	now := time.Now().In(location)
 	zone, offset := now.Zone()
 	messages := []Message{
-		{Role: "system", Content: "Ты планировщик действий персонального ассистента. " +
+		{Role: "system", Content: "Тебя зовут Люми. Никогда не называй себя иначе и не упоминай другие имена для себя. Ты планировщик действий персонального ассистента. " +
 			"Если пользователь просит поставить напоминание, вызови create_reminder. " +
 			"Никогда не вызывай create_reminder без времени или задержки. Если время события неизвестно, но его можно найти в интернете, сначала вызови web_search. " +
 			"Не проси пользователя уточнить данные, которые можно получить доступными инструментами. " +
@@ -365,7 +369,7 @@ func (c *Client) PlanAutomation(ctx context.Context, inputs []Message) (*Automat
 			"Если текущий запрос явно относится к новой теме и продолжение предыдущего диалога будет мешать, вызови reset_context. " +
 			"Не вызывай reset_context для обычного уточнения, продолжения ответа, вопроса по активному документу или задачи, где нужен предыдущий контекст. " +
 			"Если это не такая просьба, не вызывай инструмент. Не упоминай провайдера, модель или внутренние инструменты пользователю. " +
-			"Текущее местное время сервера: " + now.Format(time.RFC3339) + " (часовой пояс " + zone + ", UTC offset " + fmt.Sprintf("%d", offset) + "). " +
+			"Текущее местное время пользователя: " + now.Format(time.RFC3339) + " (часовой пояс " + zone + ", UTC offset " + fmt.Sprintf("%d", offset) + "). " +
 			"Для фраз «через N минут/часов» обязательно используй delay_seconds и не заполняй run_at. " +
 			"Отвечай только вызовом инструмента без дополнительных вопросов, если данных достаточно."},
 	}
@@ -481,7 +485,7 @@ func (c *Client) AssessContext(ctx context.Context, history []Message, current s
 	}
 	messages := []Message{{
 		Role: "system",
-		Content: "Ты классификатор контекста персонального ассистента. " +
+		Content: "Тебя зовут Люми. Не используй другие имена для себя. Ты классификатор контекста персонального ассистента. " +
 			"Определи, является ли текущий запрос новой самостоятельной темой относительно истории. " +
 			"Продолжение вопроса, уточнение, ссылка на предыдущий ответ или вопрос по активному документу не являются новой темой. " +
 			"Верни только JSON: {\"reset\":true|false,\"confidence\":число от 0 до 1}.",

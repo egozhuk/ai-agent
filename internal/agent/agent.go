@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"AI-agent/internal/integrations"
@@ -37,6 +39,13 @@ type Agent struct {
 	search      *search.Client
 	tools       *integrations.Registry
 	logger      *slog.Logger
+	pendingMu   sync.Mutex
+	pending     map[int64]pendingInput
+}
+
+type pendingInput struct {
+	kind   string
+	taskID string
 }
 
 const contextResetSignal = "__context_reset__"
@@ -55,23 +64,34 @@ func New(opts Options) *Agent {
 		search:      opts.Search,
 		tools:       opts.Tools,
 		logger:      logger,
+		pending:     make(map[int64]pendingInput),
 	}
 }
 
 func (a *Agent) HandleUpdate(ctx context.Context, update maxapi.Update) error {
 	a.logger.Debug("received MAX update", "type", update.UpdateType, "has_message", update.Message != nil, "raw_bytes", len(update.Raw))
+	if update.UpdateType == "message_callback" {
+		return a.handleCallback(ctx, update)
+	}
 	if update.UpdateType == "bot_started" {
 		userID := int64(0)
 		if update.User != nil {
 			userID = update.User.EffectiveID()
 		}
-		return a.replyIfAllowed(ctx, update, userID, "Бот запущен. Напишите задачу обычным текстом или `/usage`, чтобы посмотреть расход токенов.")
+		if !a.allowed(userID) {
+			return a.replyIfAllowed(ctx, update, userID, "Бот пока доступен только владельцу.")
+		}
+		if !a.profileComplete(userID) {
+			return a.beginProfileSetup(ctx, update, userID)
+		}
+		return a.sendMainMenu(ctx, update)
 	}
-	if update.UpdateType != "message_created" || update.Message == nil {
-		if update.UpdateType != "message_created" {
+	messageUpdate := update.UpdateType == "message_created" || (update.UpdateType == "message_edited" && update.Message != nil && update.Message.Transcription() != "")
+	if !messageUpdate || update.Message == nil {
+		if update.UpdateType != "message_created" && update.UpdateType != "message_edited" {
 			a.logger.Debug("ignored MAX update type", "type", update.UpdateType)
 		} else {
-			a.logger.Warn("message_created update has no message payload", "top_level_fields", maxapi.TopLevelFields(update.Raw))
+			a.logger.Warn("message update has no usable message payload", "type", update.UpdateType, "top_level_fields", maxapi.TopLevelFields(update.Raw))
 		}
 		return nil
 	}
@@ -85,6 +105,12 @@ func (a *Agent) HandleUpdate(ctx context.Context, update maxapi.Update) error {
 		return a.send(ctx, update, "Бот пока доступен только владельцу.")
 	}
 	text := update.Message.EffectiveText()
+	if !a.profileComplete(userID) {
+		if handled, err := a.handlePendingInput(ctx, update, userID, text); handled {
+			return err
+		}
+		return a.beginProfileSetup(ctx, update, userID)
+	}
 	hasAttachments := update.Message.HasAttachments()
 	documents := update.Message.DocumentAttachments()
 	if len(documents) > 0 {
@@ -142,6 +168,9 @@ func (a *Agent) HandleUpdate(ctx context.Context, update maxapi.Update) error {
 		}
 		return nil
 	}
+	if handled, err := a.handlePendingInput(ctx, update, userID, text); handled {
+		return err
+	}
 	if containsURL(text) {
 		// A URL is a web research request, not a document attachment. Drop a
 		// stale active document left by older MAX link-preview payloads.
@@ -162,7 +191,7 @@ func (a *Agent) HandleUpdate(ctx context.Context, update maxapi.Update) error {
 	}
 	switch strings.TrimSpace(strings.ToLower(text)) {
 	case "/start":
-		return a.send(ctx, update, "Готов. Я могу отвечать на вопросы, искать актуальную информацию в интернете и выполнять отложенные задачи.\n\nКоманды: `/remind`, `/watch`, `/reminders`, `/clear_reminders`, `/cancel`, `/clear_context`, `/usage`.")
+		return a.sendMainMenu(ctx, update)
 	case "/clear_context", "/reset_context", "/clear":
 		if err := a.store.ClearHistory(userID); err != nil {
 			return err
@@ -174,6 +203,8 @@ func (a *Agent) HandleUpdate(ctx context.Context, update maxapi.Update) error {
 	case "/usage":
 		usage := a.store.Usage(userID)
 		return a.send(ctx, update, fmt.Sprintf("Токены по вашему пользователю:\n\n- prompt: `%d`\n- completion: `%d`\n- total: `%d`", usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens))
+	case "/timezone":
+		return a.sendTimezoneSetup(ctx, update, userID)
 	case "/reminders":
 		return a.listTasks(ctx, update, userID)
 	case "/clear_reminders", "/delete_all_reminders":
@@ -290,7 +321,8 @@ func rateLimitMessage(rateLimit *mistral.APIError) string {
 
 func (a *Agent) handleMistralAutomation(ctx context.Context, update maxapi.Update, userID int64, text string, progress *maxapi.Message, depth int) (bool, string, error) {
 	inputs := append(a.store.History(userID), mistral.Message{Role: "user", Content: text})
-	call, err := a.mistral.PlanAutomation(ctx, inputs)
+	location := a.userLocation(userID)
+	call, err := a.mistral.PlanAutomation(ctx, inputs, location)
 	if err != nil {
 		return false, "", err
 	}
@@ -364,7 +396,7 @@ func (a *Agent) handleMistralAutomation(ctx context.Context, update maxapi.Updat
 		} else if strings.TrimSpace(args.RunAt) != "" {
 			parsed, parseErr := time.Parse(time.RFC3339, args.RunAt)
 			if parseErr != nil {
-				parsed, parseErr = time.ParseInLocation("2006-01-02 15:04", args.RunAt, time.Local)
+				parsed, parseErr = time.ParseInLocation("2006-01-02 15:04", args.RunAt, location)
 				if parseErr != nil {
 					return true, "Не смог разобрать время напоминания.", nil
 				}
@@ -387,7 +419,7 @@ func (a *Agent) handleMistralAutomation(ctx context.Context, update maxapi.Updat
 		if err := a.store.SaveTask(task); err != nil {
 			return true, "", err
 		}
-		answer = fmt.Sprintf("Поставил напоминание на `%s`.", runAt.In(time.Local).Format("02.01.2006 15:04"))
+		answer = fmt.Sprintf("Поставил напоминание на `%s` (%s).", runAt.In(location).Format("02.01.2006 15:04"), location.String())
 	case "schedule_research":
 		var args struct {
 			Instruction  string `json:"instruction"`
@@ -410,7 +442,7 @@ func (a *Agent) handleMistralAutomation(ctx context.Context, update maxapi.Updat
 		} else if strings.TrimSpace(args.RunAt) != "" {
 			parsed, parseErr := time.Parse(time.RFC3339, args.RunAt)
 			if parseErr != nil {
-				parsed, parseErr = time.ParseInLocation("2006-01-02 15:04", args.RunAt, time.Local)
+				parsed, parseErr = time.ParseInLocation("2006-01-02 15:04", args.RunAt, location)
 				if parseErr != nil {
 					return true, "Не смог разобрать время отложенной проверки.", nil
 				}
@@ -433,7 +465,7 @@ func (a *Agent) handleMistralAutomation(ctx context.Context, update maxapi.Updat
 		if err := a.store.SaveTask(task); err != nil {
 			return true, "", err
 		}
-		answer = fmt.Sprintf("Хорошо, проверю это через заданное время и напишу результат около `%s`.", runAt.In(time.Local).Format("02.01.2006 15:04"))
+		answer = fmt.Sprintf("Хорошо, проверю это через заданное время и напишу результат около `%s` (%s).", runAt.In(location).Format("02.01.2006 15:04"), location.String())
 	case "watch_url":
 		var args struct {
 			URL             string `json:"url"`
@@ -494,8 +526,8 @@ func (a *Agent) handleMistralAutomation(ctx context.Context, update maxapi.Updat
 		if parseErr != nil {
 			return true, "Не смог разобрать время ежедневной сводки.", nil
 		}
-		localNow := time.Now().In(time.Local)
-		nextLocal := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), hour, minute, 0, 0, time.Local)
+		localNow := time.Now().In(location)
+		nextLocal := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), hour, minute, 0, 0, location)
 		if !nextLocal.After(localNow) {
 			nextLocal = nextLocal.AddDate(0, 0, 1)
 		}
@@ -597,7 +629,7 @@ func (a *Agent) createReminder(ctx context.Context, update maxapi.Update, userID
 	if duration, err := time.ParseDuration(parts[1]); err == nil {
 		runAt = now.Add(duration)
 	} else if len(parts) >= 4 {
-		parsed, parseErr := time.ParseInLocation("2006-01-02 15:04", parts[1]+" "+parts[2], time.Local)
+		parsed, parseErr := time.ParseInLocation("2006-01-02 15:04", parts[1]+" "+parts[2], a.userLocation(userID))
 		if parseErr != nil {
 			return a.send(ctx, update, "Не понял дату. Используйте `10m` или формат `2026-07-20 10:00`.")
 		}
@@ -690,7 +722,7 @@ func (a *Agent) cancelMatchingTask(userID int64, taskID, description, runAt stri
 	if strings.TrimSpace(runAt) != "" {
 		targetTime, _ = time.Parse(time.RFC3339, strings.TrimSpace(runAt))
 		if targetTime.IsZero() {
-			targetTime, _ = time.ParseInLocation("2006-01-02 15:04", strings.TrimSpace(runAt), time.Local)
+			targetTime, _ = time.ParseInLocation("2006-01-02 15:04", strings.TrimSpace(runAt), a.userLocation(userID))
 		}
 	}
 	var matches []store.Task
@@ -699,7 +731,7 @@ func (a *Agent) cancelMatchingTask(userID int64, taskID, description, runAt stri
 		if candidate == "" || (candidate != target && !strings.Contains(candidate, target) && !strings.Contains(target, candidate)) {
 			continue
 		}
-		if !targetTime.IsZero() && !task.NextRunAt.In(time.Local).Truncate(time.Minute).Equal(targetTime.In(time.Local).Truncate(time.Minute)) {
+		if !targetTime.IsZero() && !task.NextRunAt.In(a.userLocation(userID)).Truncate(time.Minute).Equal(targetTime.In(a.userLocation(userID)).Truncate(time.Minute)) {
 			continue
 		}
 		matches = append(matches, task)
@@ -723,7 +755,373 @@ func normalizeTaskText(value string) string {
 }
 
 func (a *Agent) listTasks(ctx context.Context, update maxapi.Update, userID int64) error {
-	return a.send(ctx, update, a.tasksText(userID))
+	_, err := a.max.SendMessageWithKeyboard(ctx, updateChatID(update), userID, a.tasksText(userID), a.tasksKeyboard(userID))
+	return err
+}
+
+func (a *Agent) sendMainMenu(ctx context.Context, update maxapi.Update) error {
+	userID := updateUserID(update)
+	text := "Готов помочь. Выберите действие или просто напишите просьбу обычным текстом."
+	_, err := a.max.SendMessageWithKeyboard(ctx, updateChatID(update), userID, text, mainMenuKeyboard())
+	return err
+}
+
+func (a *Agent) hasTimezone(userID int64) bool {
+	_, err := loadUserLocation(a.store.Timezone(userID))
+	return err == nil
+}
+
+func (a *Agent) profileComplete(userID int64) bool {
+	return a.hasTimezone(userID) && strings.TrimSpace(a.store.HomeLocation(userID)) != ""
+}
+
+func (a *Agent) beginProfileSetup(ctx context.Context, update maxapi.Update, userID int64) error {
+	a.setPending(userID, pendingInput{kind: "profile"})
+	var text string
+	switch {
+	case !a.hasTimezone(userID) && strings.TrimSpace(a.store.HomeLocation(userID)) == "":
+		text = "Привет! Я Люми. Чтобы правильно ставить напоминания и смотреть погоду, напиши одним сообщением город и текущее время.\n\nНапример: `Москва, сейчас 15:40` или `Амстердам 09:20`."
+	case !a.hasTimezone(userID):
+		text = "Город сохранил. Теперь напиши, сколько сейчас времени у тебя, например `15:40`, чтобы определить часовой пояс."
+	default:
+		text = "Напиши город, в котором обычно находишься, например `Москва`. Он будет использоваться для прогноза погоды."
+	}
+	return a.send(ctx, update, text)
+}
+
+func (a *Agent) userLocation(userID int64) *time.Location {
+	location, err := loadUserLocation(a.store.Timezone(userID))
+	if err != nil {
+		return time.UTC
+	}
+	return location
+}
+
+func loadUserLocation(zone string) (*time.Location, error) {
+	if strings.HasPrefix(zone, "UTC+") || strings.HasPrefix(zone, "UTC-") {
+		if len(zone) != len("UTC+00:00") {
+			return nil, fmt.Errorf("invalid fixed timezone")
+		}
+		hour, hourErr := strconv.Atoi(zone[4:6])
+		minute, minuteErr := strconv.Atoi(zone[7:9])
+		if hourErr != nil || minuteErr != nil || minute > 59 || hour > 14 {
+			return nil, fmt.Errorf("invalid fixed timezone")
+		}
+		offset := (hour*60 + minute) * 60
+		if zone[3] == '-' {
+			offset = -offset
+		}
+		return time.FixedZone(zone, offset), nil
+	}
+	return time.LoadLocation(zone)
+}
+
+func timezoneKeyboard() [][]maxapi.KeyboardButton {
+	return [][]maxapi.KeyboardButton{
+		{{Type: "callback", Text: "🇷🇺 Москва", Payload: "ui:tz:Europe/Moscow"}, {Type: "callback", Text: "🇷🇺 Калининград", Payload: "ui:tz:Europe/Kaliningrad"}},
+		{{Type: "callback", Text: "🇷🇺 Екатеринбург", Payload: "ui:tz:Asia/Yekaterinburg"}, {Type: "callback", Text: "🇷🇺 Владивосток", Payload: "ui:tz:Asia/Vladivostok"}},
+		{{Type: "callback", Text: "🕐 Указать текущее время", Payload: "ui:tz:clock"}},
+		{{Type: "callback", Text: "🌍 Другой часовой пояс", Payload: "ui:tz:custom"}},
+	}
+}
+
+func (a *Agent) sendTimezoneSetup(ctx context.Context, update maxapi.Update, userID int64) error {
+	text := "Перед началом выберите ваш часовой пояс. Я буду использовать его для напоминаний и ежедневных сводок."
+	if zone := a.store.Timezone(userID); zone != "" {
+		text = "Текущий часовой пояс: `" + zone + "`. Выберите новый, если нужно изменить настройку."
+	} else {
+		text += "\n\nЕсли вы в Москве, выберите «Москва»."
+	}
+	_, err := a.max.SendMessageWithKeyboard(ctx, updateChatID(update), userID, text, timezoneKeyboard())
+	return err
+}
+
+func (a *Agent) handleTimezoneRequired(ctx context.Context, update maxapi.Update, userID int64) error {
+	return a.sendTimezoneSetup(ctx, update, userID)
+}
+
+func mainMenuKeyboard() [][]maxapi.KeyboardButton {
+	return [][]maxapi.KeyboardButton{
+		{{Type: "callback", Text: "🔎 Найти информацию", Payload: "ui:search"}},
+		{{Type: "callback", Text: "⏰ Напоминания", Payload: "ui:tasks"}, {Type: "callback", Text: "➕ Добавить", Payload: "ui:add"}},
+		{{Type: "callback", Text: "🌐 Следить за страницей", Payload: "ui:watch"}, {Type: "callback", Text: "📊 Расход токенов", Payload: "ui:usage"}},
+		{{Type: "callback", Text: "🔗 Подключения", Payload: "ui:connections"}, {Type: "callback", Text: "🕒 Часовой пояс", Payload: "ui:timezone"}},
+		{{Type: "callback", Text: "❓ Помощь", Payload: "ui:help"}},
+	}
+}
+
+func (a *Agent) tasksKeyboard(userID int64) [][]maxapi.KeyboardButton {
+	tasks := a.store.Tasks(userID)
+	buttons := make([][]maxapi.KeyboardButton, 0, len(tasks)+2)
+	for i, task := range tasks {
+		label := fmt.Sprintf("%d", i+1)
+		buttons = append(buttons, []maxapi.KeyboardButton{
+			{Type: "callback", Text: "✏️ Изменить #" + label, Payload: "ui:edit:" + task.ID},
+			{Type: "callback", Text: "🗑 Удалить #" + label, Payload: "ui:delete:" + task.ID},
+		})
+	}
+	buttons = append(buttons,
+		[]maxapi.KeyboardButton{{Type: "callback", Text: "➕ Новое напоминание", Payload: "ui:add"}},
+		[]maxapi.KeyboardButton{{Type: "callback", Text: "🏠 Главное меню", Payload: "ui:menu"}},
+	)
+	return buttons
+}
+
+func (a *Agent) handleCallback(ctx context.Context, update maxapi.Update) error {
+	userID := updateUserID(update)
+	a.logger.Info("received MAX callback", "user_id", userID, "payload", update.CallbackPayload(), "callback_id", update.CallbackID())
+	if !a.allowed(userID) {
+		return a.max.AnswerCallback(ctx, update.CallbackID(), "Бот доступен только владельцу")
+	}
+	payload := update.CallbackPayload()
+	_ = a.max.AnswerCallback(ctx, update.CallbackID(), "")
+	switch {
+	case payload == "ui:tz:cancel":
+		a.clearPending(userID)
+		return a.sendTimezoneSetup(ctx, update, userID)
+	case payload == "ui:tz:clock":
+		a.setPending(userID, pendingInput{kind: "timezone_clock"})
+		_, err := a.max.SendMessageWithKeyboard(ctx, updateChatID(update), userID, "Напишите, сколько сейчас времени у вас, в формате `15:40`. Я вычислю разницу с UTC.", [][]maxapi.KeyboardButton{{{Type: "callback", Text: "Отмена", Payload: "ui:tz:cancel"}}})
+		return err
+	case strings.HasPrefix(payload, "ui:tz:"):
+		zone := strings.TrimPrefix(payload, "ui:tz:")
+		if zone == "custom" {
+			a.setPending(userID, pendingInput{kind: "timezone"})
+			_, err := a.max.SendMessageWithKeyboard(ctx, updateChatID(update), userID, "Напишите часовой пояс в формате IANA, например `Europe/Moscow`, `Asia/Almaty` или `Europe/Amsterdam`.", [][]maxapi.KeyboardButton{{{Type: "callback", Text: "Отмена", Payload: "ui:tz:cancel"}}})
+			return err
+		}
+		if _, err := time.LoadLocation(zone); err != nil {
+			return a.sendTimezoneSetup(ctx, update, userID)
+		}
+		if err := a.store.SetTimezone(userID, zone); err != nil {
+			return err
+		}
+		a.clearPending(userID)
+		return a.sendMainMenu(ctx, update)
+	case payload == "ui:menu":
+		return a.sendMainMenu(ctx, update)
+	case payload == "ui:tasks":
+		return a.listTasks(ctx, update, userID)
+	case payload == "ui:add":
+		a.setPending(userID, pendingInput{kind: "create"})
+		_, err := a.max.SendMessageWithKeyboard(ctx, updateChatID(update), userID, "Напишите одним сообщением, что и когда напомнить.\n\nНапример: `через 30 минут позвонить маме` или `2026-07-25 10:00 забрать заказ`", [][]maxapi.KeyboardButton{{{Type: "callback", Text: "Отмена", Payload: "ui:cancel"}}})
+		return err
+	case payload == "ui:search":
+		return a.send(ctx, update, "Напишите, что найти — я сам выберу нужный поиск.")
+	case payload == "ui:watch":
+		return a.send(ctx, update, "Пришлите ссылку и интервал, например: `https://example.com 6h`.")
+	case payload == "ui:usage":
+		usage := a.store.Usage(userID)
+		return a.send(ctx, update, fmt.Sprintf("Токены:\n\n- prompt: `%d`\n- completion: `%d`\n- total: `%d`", usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens))
+	case payload == "ui:timezone":
+		return a.sendTimezoneSetup(ctx, update, userID)
+	case payload == "ui:connections":
+		if a.tools.HasGoogleAccount(userID) {
+			return a.send(ctx, update, "Подключено: Google Gmail/Calendar.")
+		}
+		return a.send(ctx, update, "Подключений нет. Используйте `/connect_google`.")
+	case payload == "ui:help":
+		return a.send(ctx, update, "Я умею искать информацию, работать с документами, ставить напоминания, следить за страницами и подключать Google. Просто напишите задачу обычным текстом.")
+	case payload == "ui:cancel":
+		a.clearPending(userID)
+		return a.listTasks(ctx, update, userID)
+	case strings.HasPrefix(payload, "ui:delete:"):
+		id := strings.TrimPrefix(payload, "ui:delete:")
+		if !a.store.DeleteTask(userID, id) {
+			return a.send(ctx, update, "Задача уже удалена или не найдена.")
+		}
+		return a.listTasks(ctx, update, userID)
+	case strings.HasPrefix(payload, "ui:edit:"):
+		id := strings.TrimPrefix(payload, "ui:edit:")
+		a.setPending(userID, pendingInput{kind: "edit", taskID: id})
+		_, err := a.max.SendMessageWithKeyboard(ctx, updateChatID(update), userID, "Напишите новое время и текст напоминания одним сообщением.\n\nНапример: `через 2 часа проверить почту`.", [][]maxapi.KeyboardButton{{{Type: "callback", Text: "Отмена", Payload: "ui:cancel"}}})
+		return err
+	default:
+		return a.send(ctx, update, "Не понял действие. Откройте главное меню.")
+	}
+}
+
+func updateUserID(update maxapi.Update) int64 {
+	return update.EffectiveUserID()
+}
+
+func (a *Agent) setPending(userID int64, input pendingInput) {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	a.pending[userID] = input
+}
+
+func (a *Agent) clearPending(userID int64) {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	delete(a.pending, userID)
+}
+
+func (a *Agent) pendingFor(userID int64) (pendingInput, bool) {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	input, ok := a.pending[userID]
+	return input, ok
+}
+
+func (a *Agent) handlePendingInput(ctx context.Context, update maxapi.Update, userID int64, text string) (bool, error) {
+	input, ok := a.pendingFor(userID)
+	if !ok {
+		return false, nil
+	}
+	if strings.EqualFold(strings.TrimSpace(text), "/start") {
+		a.clearPending(userID)
+		return true, a.sendMainMenu(ctx, update)
+	}
+	if input.kind == "profile" {
+		clockText := ""
+		if match := profileClockPattern.FindStringSubmatch(text); len(match) == 3 {
+			clockText = match[1] + ":" + match[2]
+		}
+		city := cleanProfileLocation(profileClockPattern.ReplaceAllString(text, ""))
+		if city != "" {
+			if err := a.store.SetHomeLocation(userID, city); err != nil {
+				return true, err
+			}
+		}
+		if clockText != "" {
+			zone, err := inferFixedTimezone(clockText, time.Now().UTC())
+			if err != nil {
+				return true, a.send(ctx, update, "Не смог определить часовой пояс по этому времени. Напиши время в формате `15:40`.")
+			}
+			if err := a.store.SetTimezone(userID, zone); err != nil {
+				return true, err
+			}
+		}
+		if strings.TrimSpace(a.store.HomeLocation(userID)) == "" {
+			return true, a.send(ctx, update, "В каком городе ты обычно находишься? Например: `Москва`.")
+		}
+		if !a.hasTimezone(userID) {
+			return true, a.send(ctx, update, "Сколько сейчас времени у тебя? Например: `15:40`.")
+		}
+		a.clearPending(userID)
+		return true, a.sendMainMenu(ctx, update)
+	}
+	if input.kind == "timezone" {
+		zone := strings.TrimSpace(text)
+		if _, err := time.LoadLocation(zone); err != nil {
+			return true, a.send(ctx, update, "Не нашел такой часовой пояс. Пример: `Europe/Moscow` или `Europe/Amsterdam`.")
+		}
+		if err := a.store.SetTimezone(userID, zone); err != nil {
+			return true, err
+		}
+		a.clearPending(userID)
+		return true, a.sendMainMenu(ctx, update)
+	}
+	if input.kind == "timezone_clock" {
+		zone, err := inferFixedTimezone(text, time.Now().UTC())
+		if err != nil {
+			return true, a.send(ctx, update, "Не понял время. Напишите его в формате `15:40`.")
+		}
+		if err := a.store.SetTimezone(userID, zone); err != nil {
+			return true, err
+		}
+		a.clearPending(userID)
+		return true, a.send(ctx, update, "Сохранил часовой пояс `"+zone+"`. Теперь можно пользоваться ботом.")
+	}
+	if strings.EqualFold(strings.TrimSpace(text), "отмена") || strings.EqualFold(strings.TrimSpace(text), "/cancel") {
+		a.clearPending(userID)
+		return true, a.listTasks(ctx, update, userID)
+	}
+	runAt, reminderText, err := parseReminderInput(text, a.userLocation(userID))
+	if err != nil {
+		return true, a.send(ctx, update, "Не понял формат. Пример: `через 30 минут позвонить` или `2026-07-25 10:00 забрать заказ`.")
+	}
+	if input.kind == "edit" {
+		tasks := a.store.Tasks(userID)
+		var task *store.Task
+		for i := range tasks {
+			if tasks[i].ID == input.taskID {
+				copy := tasks[i]
+				task = &copy
+				break
+			}
+		}
+		if task == nil {
+			a.clearPending(userID)
+			return true, a.send(ctx, update, "Напоминание уже удалено или не найдено.")
+		}
+		task.Text, task.NextRunAt = reminderText, runAt
+		if err := a.store.SaveTask(*task); err != nil {
+			return true, err
+		}
+	}
+	if input.kind == "create" {
+		task := store.Task{ID: fmt.Sprintf("reminder-%d", time.Now().UnixNano()), UserID: userID, ChatID: updateChatID(update), Kind: "reminder", Text: reminderText, NextRunAt: runAt, Active: true, CreatedAt: time.Now().UTC()}
+		if err := a.store.SaveTask(task); err != nil {
+			return true, err
+		}
+	}
+	a.clearPending(userID)
+	return true, a.listTasks(ctx, update, userID)
+}
+
+var profileClockPattern = regexp.MustCompile(`\b([01]?\d|2[0-3]):([0-5]\d)\b`)
+
+func cleanProfileLocation(text string) string {
+	value := strings.TrimSpace(text)
+	for _, phrase := range []string{"сейчас", "текущее время", "мое время", "моё время", "сколько времени", "я в", "нахожусь в", "город"} {
+		value = strings.ReplaceAll(strings.ToLower(value), phrase, "")
+	}
+	value = strings.TrimSpace(strings.Trim(value, " ,.;:-"))
+	value = strings.TrimPrefix(value, "в ")
+	return strings.TrimSpace(strings.Trim(value, " ,.;:-"))
+}
+
+func parseReminderInput(text string, location *time.Location) (time.Time, string, error) {
+	parts := strings.Fields(strings.TrimSpace(text))
+	if len(parts) < 2 {
+		return time.Time{}, "", fmt.Errorf("missing reminder text")
+	}
+	if strings.EqualFold(parts[0], "через") {
+		if len(parts) < 3 {
+			return time.Time{}, "", fmt.Errorf("missing delay")
+		}
+		if delay, ok := parseRelativeDelay(strings.Join(parts[:3], " ")); ok && len(parts) >= 4 {
+			return time.Now().UTC().Add(delay), strings.TrimSpace(strings.Join(parts[3:], " ")), nil
+		}
+	}
+	if duration, err := time.ParseDuration(parts[0]); err == nil && len(parts) >= 2 {
+		return time.Now().UTC().Add(duration), strings.TrimSpace(strings.Join(parts[1:], " ")), nil
+	}
+	if len(parts) >= 3 {
+		parsed, err := time.ParseInLocation("2006-01-02 15:04", parts[0]+" "+parts[1], location)
+		if err == nil {
+			return parsed.UTC(), strings.TrimSpace(strings.Join(parts[2:], " ")), nil
+		}
+	}
+	return time.Time{}, "", fmt.Errorf("invalid reminder input")
+}
+
+func inferFixedTimezone(text string, nowUTC time.Time) (string, error) {
+	parsed, err := time.Parse("15:04", strings.TrimSpace(text))
+	if err != nil {
+		return "", err
+	}
+	currentMinutes := nowUTC.Hour()*60 + nowUTC.Minute()
+	askedMinutes := parsed.Hour()*60 + parsed.Minute()
+	diff := askedMinutes - currentMinutes
+	if diff > 12*60 {
+		diff -= 24 * 60
+	}
+	if diff < -12*60 {
+		diff += 24 * 60
+	}
+	if diff < -12*60 || diff > 14*60 {
+		return "", fmt.Errorf("timezone offset out of range")
+	}
+	sign := "+"
+	absolute := diff
+	if diff < 0 {
+		sign = "-"
+		absolute = -diff
+	}
+	return fmt.Sprintf("UTC%s%02d:%02d", sign, absolute/60, absolute%60), nil
 }
 
 func (a *Agent) tasksText(userID int64) string {
@@ -734,7 +1132,7 @@ func (a *Agent) tasksText(userID int64) string {
 	var b strings.Builder
 	b.WriteString("Активные задачи:")
 	for _, task := range tasks {
-		b.WriteString(fmt.Sprintf("\n- %s", taskDescription(task)))
+		b.WriteString(fmt.Sprintf("\n- %s", taskDescription(task, a.userLocation(userID))))
 	}
 	return b.String()
 }
@@ -759,9 +1157,9 @@ func formatInterval(seconds int64) string {
 	return strconv.FormatInt(seconds/60, 10) + "m"
 }
 
-func taskDescription(task store.Task) string {
+func taskDescription(task store.Task, location *time.Location) string {
 	if task.Kind == "reminder" {
-		return "напоминание на " + task.NextRunAt.Local().Format("02.01 15:04") + ": " + task.Text
+		return "напоминание на " + task.NextRunAt.In(location).Format("02.01 15:04") + ": " + task.Text
 	}
 	return "проверка " + task.URL + " каждые " + formatInterval(task.IntervalSeconds)
 }
@@ -782,7 +1180,8 @@ func (a *Agent) askMistral(ctx context.Context, userID int64, text string) (stri
 	if document, ok := a.store.ActiveDocument(userID); ok && strings.TrimSpace(document.URL) != "" && !containsURL(text) {
 		return a.askDocument(ctx, userID, text, document.URL)
 	}
-	instructions := "Ты персональный AI-ассистент в мессенджере MAX. Отвечай по-русски, кратко и по делу. " +
+	instructions := "Тебя зовут Люми. Всегда называй себя только Люми и никогда не упоминай никакие другие имена для себя. " +
+		"Ты персональный AI-ассистент в мессенджере MAX. Отвечай по-русски, кратко и по делу. " +
 		"Актуальная информация уже передается в запросе после отдельного шага поиска, если он был нужен. " +
 		"Не выдумывай ссылки и источники. " +
 		"Если пользователь просит поставить напоминание без времени, не говори, что это невозможно, а уточни время. " +
@@ -915,7 +1314,7 @@ func (a *Agent) updateProgress(ctx context.Context, progress *maxapi.Message, te
 
 func (a *Agent) sendMessage(ctx context.Context, update maxapi.Update, text string) (*maxapi.Message, error) {
 	chatID := int64(0)
-	userID := int64(0)
+	userID := updateUserID(update)
 	if update.ChatID != nil {
 		chatID = *update.ChatID
 	}
@@ -923,10 +1322,6 @@ func (a *Agent) sendMessage(ctx context.Context, update maxapi.Update, text stri
 		if msgChatID := update.Message.EffectiveChatID(); chatID == 0 && msgChatID != 0 {
 			chatID = msgChatID
 		}
-		userID = update.Message.EffectiveSenderID()
-	}
-	if userID == 0 && update.User != nil {
-		userID = update.User.EffectiveID()
 	}
 	return a.max.SendMessage(ctx, chatID, userID, text)
 }

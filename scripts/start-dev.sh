@@ -13,7 +13,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if ! curl --max-time 1 -fsS "${SEARCH_API_BASE_URL:-http://127.0.0.1:8888}/search?q=test&format=json" >/dev/null 2>&1; then
-	"$ROOT_DIR/scripts/start-searxng.sh" &
+	"$ROOT_DIR/scripts/start-searxng.sh" --foreground &
 	SEARXNG_PID=$!
 
 	ready=0

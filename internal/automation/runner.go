@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,7 +73,8 @@ func (r *Runner) runDue(ctx context.Context, now time.Time) {
 }
 
 func (r *Runner) runDailyDigest(ctx context.Context, task store.Task, now time.Time) {
-	localNow := now.In(time.Local)
+	location := r.userLocation(task.UserID)
+	localNow := now.In(location)
 	tasks := r.store.TasksForDate(task.UserID, localNow)
 	var b strings.Builder
 	b.WriteString("📋 Задачи на сегодня:")
@@ -80,26 +82,53 @@ func (r *Runner) runDailyDigest(ctx context.Context, task store.Task, now time.T
 		b.WriteString("\n\nНа сегодня запланированных задач нет.")
 	} else {
 		for _, item := range tasks {
-			b.WriteString("\n- " + taskDescription(item))
+			b.WriteString("\n- " + r.taskDescription(item))
 		}
 	}
 	if _, err := r.max.SendMessage(ctx, task.ChatID, task.UserID, b.String()); err != nil {
 		r.logger.Warn("daily digest delivery failed", "task_id", task.ID, "error", err)
 		return
 	}
-	nextLocal := task.NextRunAt.In(time.Local)
-	nextLocal = time.Date(nextLocal.Year(), nextLocal.Month(), nextLocal.Day()+1, nextLocal.Hour(), nextLocal.Minute(), 0, 0, time.Local)
+	nextLocal := task.NextRunAt.In(location)
+	nextLocal = time.Date(nextLocal.Year(), nextLocal.Month(), nextLocal.Day()+1, nextLocal.Hour(), nextLocal.Minute(), 0, 0, location)
 	task.NextRunAt = nextLocal.UTC()
 	if err := r.store.SaveTask(task); err != nil {
 		r.logger.Warn("daily digest state save failed", "task_id", task.ID, "error", err)
 	}
 }
 
-func taskDescription(task store.Task) string {
+func (r *Runner) taskDescription(task store.Task) string {
 	if task.Kind == "reminder" {
-		return "напоминание на " + task.NextRunAt.In(time.Local).Format("15:04") + ": " + task.Text
+		return "напоминание на " + task.NextRunAt.In(r.userLocation(task.UserID)).Format("15:04") + ": " + task.Text
 	}
 	return "проверка страницы: " + task.URL
+}
+
+func (r *Runner) userLocation(userID int64) *time.Location {
+	location, err := loadLocation(r.store.Timezone(userID))
+	if err != nil {
+		return time.UTC
+	}
+	return location
+}
+
+func loadLocation(zone string) (*time.Location, error) {
+	if strings.HasPrefix(zone, "UTC+") || strings.HasPrefix(zone, "UTC-") {
+		if len(zone) != len("UTC+00:00") {
+			return nil, fmt.Errorf("invalid fixed timezone")
+		}
+		hour, hourErr := strconv.Atoi(zone[4:6])
+		minute, minuteErr := strconv.Atoi(zone[7:9])
+		if hourErr != nil || minuteErr != nil || hour > 14 || minute > 59 {
+			return nil, fmt.Errorf("invalid fixed timezone")
+		}
+		offset := (hour*60 + minute) * 60
+		if zone[3] == '-' {
+			offset = -offset
+		}
+		return time.FixedZone(zone, offset), nil
+	}
+	return time.LoadLocation(zone)
 }
 
 func (r *Runner) runReminder(ctx context.Context, task store.Task) {
@@ -121,7 +150,7 @@ func (r *Runner) runScheduledResearch(ctx context.Context, task store.Task) {
 		resp, err := r.search.Search(ctx, task.Text)
 		if err == nil {
 			answer, answerErr := r.mistral.Complete(ctx, []mistral.Message{
-				{Role: "system", Content: "Ответь по-русски кратко по материалам поиска. Не выдумывай факты."},
+				{Role: "system", Content: "Тебя зовут Люми. Называй себя только Люми и никогда не используй другие имена для себя. Ответь по-русски кратко по материалам поиска. Не выдумывай факты."},
 				{Role: "user", Content: "Выполни отложенную задачу и сообщи результат:\n" + task.Text + "\n\nМатериалы:\n" + resp.Content},
 			}, nil)
 			if answerErr == nil && len(answer.Choices) > 0 {
@@ -224,7 +253,7 @@ func (r *Runner) summarizeChange(ctx context.Context, userID int64, pageURL, pre
 		return fallback
 	}
 	messages := []mistral.Message{
-		{Role: "system", Content: "Ты анализируешь изменения на веб-странице. Отвечай по-русски кратко: что изменилось, без выдумок. Если данных недостаточно, так и скажи."},
+		{Role: "system", Content: "Тебя зовут Люми. Называй себя только Люми и никогда не используй другие имена для себя. Ты анализируешь изменения на веб-странице. Отвечай по-русски кратко: что изменилось, без выдумок. Если данных недостаточно, так и скажи."},
 		{Role: "user", Content: fmt.Sprintf("URL: %s\n\nПредыдущая версия:\n%s\n\nНовая версия:\n%s", pageURL, previous, current)},
 	}
 	resp, err := r.mistral.Complete(ctx, messages, nil)

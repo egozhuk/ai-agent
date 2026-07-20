@@ -28,6 +28,18 @@ func TestSQLiteStoreRoundTrip(t *testing.T) {
 	if got := st.Usage(userID); got.TotalTokens != 5 {
 		t.Fatalf("unexpected usage: %#v", got)
 	}
+	if err := st.SetTimezone(userID, "Europe/Moscow"); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Timezone(userID); got != "Europe/Moscow" {
+		t.Fatalf("unexpected timezone: %q", got)
+	}
+	if err := st.SetHomeLocation(userID, "Москва"); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.HomeLocation(userID); got != "Москва" {
+		t.Fatalf("unexpected home location: %q", got)
+	}
 
 	task := Task{ID: "task-1", UserID: userID, Kind: "reminder", Text: "Проверка", NextRunAt: time.Now().UTC().Add(-time.Minute), Active: true, CreatedAt: time.Now().UTC()}
 	if err := st.SaveTask(task); err != nil {

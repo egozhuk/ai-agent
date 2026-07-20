@@ -152,7 +152,7 @@ func runPolling(ctx context.Context, logger *slog.Logger, maxClient *maxapi.Clie
 		default:
 		}
 
-		resp, err := maxClient.GetUpdates(ctx, marker, []string{"message_created", "bot_started"})
+		resp, err := maxClient.GetUpdates(ctx, marker, []string{"message_created", "message_edited", "message_callback", "bot_started"})
 		if err != nil {
 			logger.Warn("get updates failed", "error", err)
 			time.Sleep(3 * time.Second)

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -36,6 +37,9 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	// Load local development settings when the application is started with
+	// `go run .` or `./ai-agent`. Explicit shell environment variables win.
+	_ = loadDotEnv(".env")
 	cfg := Config{
 		Mode:               Mode(env("BOT_MODE", string(ModePolling))),
 		AccessMode:         env("ACCESS_MODE", "owner"),
@@ -80,6 +84,48 @@ func Load() (Config, error) {
 		return Config{}, errors.New("GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, PUBLIC_BASE_URL, and TOKEN_ENCRYPTION_KEY are all required to enable Google integrations")
 	}
 	return cfg, nil
+}
+
+func loadDotEnv(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" || os.Getenv(key) != "" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
+			if value[0] == '"' {
+				if decoded, decodeErr := strconv.Unquote(value); decodeErr == nil {
+					value = decoded
+				}
+			} else {
+				value = value[1 : len(value)-1]
+			}
+		}
+		if err := os.Setenv(key, value); err != nil {
+			return err
+		}
+	}
+	return scanner.Err()
 }
 
 func env(key, fallback string) string {

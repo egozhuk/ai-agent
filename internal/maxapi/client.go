@@ -78,6 +78,62 @@ func (u *Update) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (u Update) CallbackID() string {
+	if callback, ok := u.callback(); ok {
+		return callback.CallbackID
+	}
+	return findStringField(u.Raw, "callback_id")
+}
+
+func (u Update) CallbackPayload() string {
+	if callback, ok := u.callback(); ok {
+		return callback.Payload
+	}
+	return findStringField(u.Raw, "payload")
+}
+
+func (u Update) EffectiveUserID() int64 {
+	if u.User != nil && u.User.EffectiveID() != 0 {
+		return u.User.EffectiveID()
+	}
+	if callback, ok := u.callback(); ok && callback.UserID() != 0 {
+		return callback.UserID()
+	}
+	if u.Message != nil && u.Message.EffectiveSenderID() != 0 {
+		return u.Message.EffectiveSenderID()
+	}
+	return findIntField(u.Raw, "user_id")
+}
+
+type callbackData struct {
+	CallbackID string `json:"callback_id"`
+	Payload    string `json:"payload"`
+	User       struct {
+		ID     int64 `json:"id"`
+		UserID int64 `json:"user_id"`
+	} `json:"user"`
+}
+
+func (c callbackData) UserID() int64 {
+	if c.User.UserID != 0 {
+		return c.User.UserID
+	}
+	return c.User.ID
+}
+
+func (u Update) callback() (callbackData, bool) {
+	if len(u.Raw) == 0 {
+		return callbackData{}, false
+	}
+	var envelope struct {
+		Callback *callbackData `json:"callback"`
+	}
+	if err := json.Unmarshal(u.Raw, &envelope); err != nil || envelope.Callback == nil {
+		return callbackData{}, false
+	}
+	return *envelope.Callback, true
+}
+
 func messageFromNestedPayload(value any) *Message {
 	switch current := value.(type) {
 	case map[string]json.RawMessage:
@@ -162,6 +218,28 @@ type MessageBody struct {
 	Text string `json:"text,omitempty"`
 }
 
+type KeyboardButton struct {
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Payload string `json:"payload,omitempty"`
+}
+
+type InlineKeyboard struct {
+	Type    string          `json:"type"`
+	Payload KeyboardPayload `json:"payload"`
+}
+
+type KeyboardPayload struct {
+	Buttons [][]KeyboardButton `json:"buttons"`
+}
+
+type NewMessageBody struct {
+	Text        string           `json:"text"`
+	Format      string           `json:"format,omitempty"`
+	Notify      bool             `json:"notify,omitempty"`
+	Attachments []InlineKeyboard `json:"attachments,omitempty"`
+}
+
 type MediaAttachment struct {
 	Type     string
 	Name     string
@@ -196,10 +274,17 @@ func (m Message) EffectiveText() string {
 	if strings.TrimSpace(m.Text) != "" {
 		return strings.TrimSpace(m.Text)
 	}
+	if transcription := findStringField(m.Raw, "transcription"); transcription != "" {
+		return strings.TrimSpace(transcription)
+	}
 	if text := findStringField(m.Raw, "text"); text != "" {
 		return strings.TrimSpace(text)
 	}
 	return ""
+}
+
+func (m Message) Transcription() string {
+	return strings.TrimSpace(findStringField(m.Raw, "transcription"))
 }
 
 func (m Message) EffectiveSenderID() int64 {
@@ -223,6 +308,16 @@ func (m Message) EffectiveChatID() int64 {
 		return id
 	}
 	return 0
+}
+
+func (m Message) EffectiveID() string {
+	if strings.TrimSpace(m.ID) != "" {
+		return m.ID
+	}
+	if id := findStringField(m.Raw, "message_id"); id != "" {
+		return id
+	}
+	return findStringField(m.Raw, "mid")
 }
 
 func (m Message) HasAttachments() bool {
@@ -364,8 +459,8 @@ func (c *Client) GetUpdates(ctx context.Context, marker *int64, types []string) 
 	values := url.Values{}
 	values.Set("limit", "20")
 	values.Set("timeout", "30")
-	for _, typ := range types {
-		values.Add("types", typ)
+	if len(types) > 0 {
+		values.Set("types", strings.Join(types, ","))
 	}
 	if marker != nil {
 		values.Set("marker", strconv.FormatInt(*marker, 10))
@@ -377,6 +472,14 @@ func (c *Client) GetUpdates(ctx context.Context, marker *int64, types []string) 
 }
 
 func (c *Client) SendMessage(ctx context.Context, chatID int64, userID int64, text string) (*Message, error) {
+	return c.sendMessage(ctx, chatID, userID, text, nil)
+}
+
+func (c *Client) SendMessageWithKeyboard(ctx context.Context, chatID int64, userID int64, text string, buttons [][]KeyboardButton) (*Message, error) {
+	return c.sendMessage(ctx, chatID, userID, text, buttons)
+}
+
+func (c *Client) sendMessage(ctx context.Context, chatID int64, userID int64, text string, buttons [][]KeyboardButton) (*Message, error) {
 	if len([]rune(text)) > 3900 {
 		text = string([]rune(text)[:3900])
 	}
@@ -390,6 +493,9 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, userID int64, te
 		"text":   text,
 		"format": "markdown",
 		"notify": true,
+	}
+	if len(buttons) > 0 {
+		body["attachments"] = []InlineKeyboard{{Type: "inline_keyboard", Payload: KeyboardPayload{Buttons: buttons}}}
 	}
 	var response json.RawMessage
 	if err := c.do(ctx, http.MethodPost, "/messages?"+values.Encode(), body, &response); err != nil {
@@ -412,6 +518,10 @@ func (c *Client) DeleteMessage(ctx context.Context, messageID string) error {
 }
 
 func (c *Client) EditMessage(ctx context.Context, messageID, text string) error {
+	return c.EditMessageWithKeyboard(ctx, messageID, text, nil)
+}
+
+func (c *Client) EditMessageWithKeyboard(ctx context.Context, messageID, text string, buttons [][]KeyboardButton) error {
 	if strings.TrimSpace(messageID) == "" {
 		return nil
 	}
@@ -424,7 +534,20 @@ func (c *Client) EditMessage(ctx context.Context, messageID, text string) error 
 		"text":   text,
 		"format": "markdown",
 	}
+	if buttons != nil {
+		body["attachments"] = []InlineKeyboard{{Type: "inline_keyboard", Payload: KeyboardPayload{Buttons: buttons}}}
+	}
 	return c.do(ctx, http.MethodPut, "/messages?"+values.Encode(), body, nil)
+}
+
+func (c *Client) AnswerCallback(ctx context.Context, callbackID, notification string) error {
+	if strings.TrimSpace(callbackID) == "" {
+		return nil
+	}
+	values := url.Values{}
+	values.Set("callback_id", callbackID)
+	body := map[string]any{"notification": notification}
+	return c.do(ctx, http.MethodPost, "/answers?"+values.Encode(), body, nil)
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {

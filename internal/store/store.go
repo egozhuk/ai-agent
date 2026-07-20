@@ -47,6 +47,8 @@ type Document struct {
 
 type UserRecord struct {
 	UserID           int64              `json:"user_id"`
+	Timezone         string             `json:"timezone,omitempty"`
+	HomeLocation     string             `json:"home_location,omitempty"`
 	FirstSeenAt      time.Time          `json:"first_seen_at"`
 	LastSeenAt       time.Time          `json:"last_seen_at"`
 	PromptTokens     int                `json:"prompt_tokens"`
@@ -104,6 +106,8 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
+	timezone TEXT NOT NULL DEFAULT '',
+	home_location TEXT NOT NULL DEFAULT '',
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
@@ -157,6 +161,14 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id, created_at DESC
 );`)
 	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE users ADD COLUMN timezone TEXT NOT NULL DEFAULT ''`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE users ADD COLUMN home_location TEXT NOT NULL DEFAULT ''`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return err
 	}
 	_, err = s.db.Exec(`ALTER TABLE tasks ADD COLUMN last_snapshot TEXT`)
@@ -355,8 +367,50 @@ func (s *Store) Usage(userID int64) UserRecord {
 		return UserRecord{}
 	}
 	var rec UserRecord
-	_ = s.db.QueryRow(`SELECT user_id, first_seen_at, last_seen_at, prompt_tokens, completion_tokens, total_tokens FROM users WHERE user_id = ?`, userID).Scan(&rec.UserID, (*databaseTime)(&rec.FirstSeenAt), (*databaseTime)(&rec.LastSeenAt), &rec.PromptTokens, &rec.CompletionTokens, &rec.TotalTokens)
+	_ = s.db.QueryRow(`SELECT user_id, timezone, home_location, first_seen_at, last_seen_at, prompt_tokens, completion_tokens, total_tokens FROM users WHERE user_id = ?`, userID).Scan(&rec.UserID, &rec.Timezone, &rec.HomeLocation, (*databaseTime)(&rec.FirstSeenAt), (*databaseTime)(&rec.LastSeenAt), &rec.PromptTokens, &rec.CompletionTokens, &rec.TotalTokens)
 	return rec
+}
+
+func (s *Store) Timezone(userID int64) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureUserLocked(userID); err != nil {
+		return ""
+	}
+	var timezone string
+	_ = s.db.QueryRow(`SELECT timezone FROM users WHERE user_id = ?`, userID).Scan(&timezone)
+	return timezone
+}
+
+func (s *Store) SetTimezone(userID int64, timezone string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureUserLocked(userID); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE users SET timezone = ?, last_seen_at = ? WHERE user_id = ?`, timezone, time.Now().UTC().Format(time.RFC3339Nano), userID)
+	return err
+}
+
+func (s *Store) HomeLocation(userID int64) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureUserLocked(userID); err != nil {
+		return ""
+	}
+	var location string
+	_ = s.db.QueryRow(`SELECT home_location FROM users WHERE user_id = ?`, userID).Scan(&location)
+	return location
+}
+
+func (s *Store) SetHomeLocation(userID int64, location string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureUserLocked(userID); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE users SET home_location = ?, last_seen_at = ? WHERE user_id = ?`, location, time.Now().UTC().Format(time.RFC3339Nano), userID)
+	return err
 }
 
 func (s *Store) SaveAccount(userID int64, account Account) error {
@@ -467,7 +521,7 @@ func (s *Store) migrateLegacyJSON(dbPath string) error {
 		if err := s.ensureUserLocked(user.UserID); err != nil {
 			return err
 		}
-		_, err := s.db.Exec(`UPDATE users SET first_seen_at = ?, last_seen_at = ?, prompt_tokens = ?, completion_tokens = ?, total_tokens = ? WHERE user_id = ?`, user.FirstSeenAt.UTC().Format(time.RFC3339Nano), user.LastSeenAt.UTC().Format(time.RFC3339Nano), user.PromptTokens, user.CompletionTokens, user.TotalTokens, user.UserID)
+		_, err := s.db.Exec(`UPDATE users SET timezone = ?, home_location = ?, first_seen_at = ?, last_seen_at = ?, prompt_tokens = ?, completion_tokens = ?, total_tokens = ? WHERE user_id = ?`, user.Timezone, user.HomeLocation, user.FirstSeenAt.UTC().Format(time.RFC3339Nano), user.LastSeenAt.UTC().Format(time.RFC3339Nano), user.PromptTokens, user.CompletionTokens, user.TotalTokens, user.UserID)
 		if err != nil {
 			return err
 		}
